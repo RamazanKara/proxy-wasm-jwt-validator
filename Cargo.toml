@@ -1,0 +1,31 @@
+[package]
+name = "proxy-wasm-jwt-validator"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Proxy-Wasm JWT and API token validator for Varnish and vmod-wasm"
+repository = "https://github.com/RamazanKara/proxy-wasm-jwt-validator"
+readme = "README.md"
+keywords = ["proxy-wasm", "varnish", "jwt", "api-token", "edge"]
+categories = ["authentication", "wasm", "web-programming"]
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+hex = "0.4"
+hmac = "0.12"
+proxy-wasm = "0.2.5"
+serde = { version = "1", features = ["derive"] }
+serde-json-wasm = "1"
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+sha2 = "0.10"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
