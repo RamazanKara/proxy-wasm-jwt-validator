@@ -9,6 +9,25 @@ pub struct JwtKey {
     pub alg: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct Jwks {
+    #[serde(default)]
+    pub keys: Vec<JwkKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct JwkKey {
+    pub kty: String,
+    #[serde(default)]
+    pub kid: Option<String>,
+    #[serde(default)]
+    pub alg: Option<String>,
+    #[serde(default, rename = "use")]
+    pub key_use: Option<String>,
+    pub n: String,
+    pub e: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct ApiToken {
     pub id: String,
@@ -23,6 +42,8 @@ pub struct ApiToken {
 pub struct ValidatorConfig {
     #[serde(default)]
     pub keys: Vec<JwtKey>,
+    #[serde(default)]
+    pub jwks: Jwks,
     #[serde(default)]
     pub api_tokens: Vec<ApiToken>,
     #[serde(default = "default_authorization_header")]
@@ -65,6 +86,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             keys: Vec::new(),
+            jwks: Jwks::default(),
             api_tokens: Vec::new(),
             authorization_header: default_authorization_header(),
             api_key_header: default_api_key_header(),
@@ -107,7 +129,31 @@ pub fn parse_config(data: &[u8]) -> Result<ValidatorConfig, String> {
 
     for key in &config.keys {
         if key.alg != "HS256" {
-            return Err("invalid-config: only HS256 keys are supported in 0.1.0".to_string());
+            return Err(
+                "invalid-config: keys support HS256 only; use jwks.keys for RS256".to_string(),
+            );
+        }
+        if key.id.is_empty() || key.secret.is_empty() {
+            return Err("invalid-config: HS256 keys require non-empty id and secret".to_string());
+        }
+    }
+
+    for key in &config.jwks.keys {
+        if key.kty != "RSA" {
+            return Err("invalid-config: jwks.keys only supports RSA keys".to_string());
+        }
+        if let Some(alg) = key.alg.as_deref() {
+            if alg != "RS256" {
+                return Err("invalid-config: jwks.keys only supports RS256".to_string());
+            }
+        }
+        if let Some(key_use) = key.key_use.as_deref() {
+            if key_use != "sig" {
+                return Err("invalid-config: jwks.keys use must be sig".to_string());
+            }
+        }
+        if key.kid.as_deref().unwrap_or("").is_empty() || key.n.is_empty() || key.e.is_empty() {
+            return Err("invalid-config: RS256 JWKs require kid, n, and e".to_string());
         }
     }
 
@@ -181,6 +227,7 @@ mod tests {
     fn parses_full_config() {
         let json = br#"{
             "keys":[{"id":"primary","secret":"topsecret"}],
+            "jwks":{"keys":[{"kty":"RSA","kid":"rsa","alg":"RS256","use":"sig","n":"abc","e":"AQAB"}]},
             "api_tokens":[{"id":"svc","token":"opaque","subject":"service-a","scopes":["read"]}],
             "issuer":"https://issuer.example",
             "audience":"edge",
@@ -193,6 +240,7 @@ mod tests {
         assert!(config.is_report_mode());
         assert!(config.require_kid);
         assert_eq!(config.keys[0].alg, "HS256");
+        assert_eq!(config.jwks.keys[0].kid.as_deref(), Some("rsa"));
         assert_eq!(config.api_tokens[0].subject, "service-a");
         assert_eq!(config.required_claims.get("tier").unwrap(), "gold");
     }
@@ -202,5 +250,14 @@ mod tests {
         let err =
             parse_config(br#"{"keys":[{"id":"rsa","secret":"x","alg":"RS256"}]}"#).unwrap_err();
         assert!(err.contains("HS256"));
+    }
+
+    #[test]
+    fn rejects_unsupported_jwk_alg() {
+        let err = parse_config(
+            br#"{"jwks":{"keys":[{"kty":"RSA","kid":"rsa","alg":"RS384","n":"abc","e":"AQAB"}]}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("RS256"));
     }
 }

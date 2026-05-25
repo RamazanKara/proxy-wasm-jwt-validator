@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 covers RSA private-key timing side channels. This
+    # module only performs public RS256 signature verification against JWKS.
+    "RUSTSEC-2023-0071",
+]

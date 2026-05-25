@@ -1,11 +1,15 @@
-use crate::config::{ApiToken, JwtKey, ValidatorConfig};
+use crate::config::{ApiToken, JwkKey, JwtKey, ValidatorConfig};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
+use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey};
+use rsa::sha2::Sha256 as RsaSha256;
+use rsa::signature::Verifier;
+use rsa::{BoxedUint, RsaPublicKey};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::Sha256;
+use sha2::Sha256 as HmacSha256Digest;
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = Hmac<HmacSha256Digest>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthContext {
@@ -54,18 +58,22 @@ pub fn validate_jwt(
     let header_bytes = decode_segment(header_b64)?;
     let header: JwtHeader =
         serde_json::from_slice(&header_bytes).map_err(|_| "invalid-jwt-header".to_string())?;
-    if header.alg != "HS256" {
-        return Err("unsupported-alg".to_string());
-    }
-
-    let key = select_jwt_key(config, header.kid.as_deref())?;
-    if key.alg != header.alg {
-        return Err("key-alg-mismatch".to_string());
-    }
 
     let signing_input = format!("{header_b64}.{payload_b64}");
     let signature = decode_segment(signature_b64)?;
-    verify_hs256(key.secret.as_bytes(), signing_input.as_bytes(), &signature)?;
+    let key_id = match header.alg.as_str() {
+        "HS256" => {
+            let key = select_hs256_key(config, header.kid.as_deref())?;
+            verify_hs256(key.secret.as_bytes(), signing_input.as_bytes(), &signature)?;
+            key.id.clone()
+        }
+        "RS256" => {
+            let key = select_rs256_key(config, header.kid.as_deref())?;
+            verify_rs256(key, signing_input.as_bytes(), &signature)?;
+            key.kid.clone().unwrap_or_default()
+        }
+        _ => return Err("unsupported-alg".to_string()),
+    };
 
     let payload_bytes = decode_segment(payload_b64)?;
     let claims: Value =
@@ -74,7 +82,7 @@ pub fn validate_jwt(
 
     Ok(AuthContext {
         token_type: "jwt".to_string(),
-        key_id: key.id.clone(),
+        key_id,
         subject: claim_string(&claims, "sub").unwrap_or_default(),
         issuer: claim_string(&claims, "iss").unwrap_or_default(),
         scopes: claim_scopes(&claims),
@@ -101,7 +109,7 @@ fn api_context(token: &ApiToken) -> AuthContext {
     }
 }
 
-fn select_jwt_key<'a>(
+fn select_hs256_key<'a>(
     config: &'a ValidatorConfig,
     kid: Option<&str>,
 ) -> Result<&'a JwtKey, String> {
@@ -120,6 +128,30 @@ fn select_jwt_key<'a>(
     match config.keys.as_slice() {
         [key] => Ok(key),
         [] => Err("no-jwt-keys-configured".to_string()),
+        _ => Err("missing-kid".to_string()),
+    }
+}
+
+fn select_rs256_key<'a>(
+    config: &'a ValidatorConfig,
+    kid: Option<&str>,
+) -> Result<&'a JwkKey, String> {
+    if let Some(kid) = kid {
+        return config
+            .jwks
+            .keys
+            .iter()
+            .find(|key| key.kid.as_deref() == Some(kid))
+            .ok_or_else(|| "unknown-kid".to_string());
+    }
+
+    if config.require_kid {
+        return Err("missing-kid".to_string());
+    }
+
+    match config.jwks.keys.as_slice() {
+        [key] => Ok(key),
+        [] => Err("no-rs256-keys-configured".to_string()),
         _ => Err("missing-kid".to_string()),
     }
 }
@@ -175,6 +207,23 @@ fn verify_hs256(secret: &[u8], signing_input: &[u8], signature: &[u8]) -> Result
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(signing_input);
     mac.verify_slice(signature)
+        .map_err(|_| "invalid-jwt-signature".to_string())
+}
+
+fn verify_rs256(key: &JwkKey, signing_input: &[u8], signature: &[u8]) -> Result<(), String> {
+    let modulus = decode_segment(&key.n).map_err(|_| "invalid-jwk-parameter".to_string())?;
+    let exponent = decode_segment(&key.e).map_err(|_| "invalid-jwk-parameter".to_string())?;
+    let public_key = RsaPublicKey::new(
+        BoxedUint::from_be_slice_vartime(&modulus),
+        BoxedUint::from_be_slice_vartime(&exponent),
+    )
+    .map_err(|_| "invalid-jwk-rsa-key".to_string())?;
+    let verifying_key = VerifyingKey::<RsaSha256>::new(public_key);
+    let signature =
+        RsaSignature::try_from(signature).map_err(|_| "invalid-jwt-signature".to_string())?;
+
+    verifying_key
+        .verify(signing_input, &signature)
         .map_err(|_| "invalid-jwt-signature".to_string())
 }
 
@@ -247,7 +296,10 @@ pub fn sign_hs256(header_json: &str, claims_json: &str, secret: &[u8]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiToken, JwtKey};
+    use crate::config::{ApiToken, JwkKey, Jwks, JwtKey};
+
+    const RSA_MODULUS: &str = "2mdj9UDsk76yaVX1tomwsni1QqCwDYovdSXQtRwsXOBxGOyg0bokCBiQZh5Odtug00n0S-OgBTDtW-6Tx59YcNhAl7tQz4fEm0q_hDzFXfQUZjEhM0yt8-F3y1P8a4d3U0iHBYmvZn2BkTec8n2NY1YiBdTg1BrG6G8Iy3mxB6yim5NsT-K2SdcivaE5SRHnSfCQr53BwzYlJHEu9bQ-O7mQqijJj6RULpmojhjSDaMcDgVCZ89OWiIozH-EbyHVQwsaaFEmpn8-zFTml3QaA1oJNk4_HkPno1aHOZNi4m1ihxzzDwipn4MCnPi4rVWAjJy5FB-6z75CDsjCl_i9Fw";
+    const RSA_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS10ZXN0LWtleSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiYXVkIjoiZWRnZSIsInN1YiI6InVzZXItcnNhIiwiZXhwIjo0MTAyNDQ0ODAwLCJuYmYiOjE3MDAwMDAwMDAsInNjb3BlIjoicmVhZCB3cml0ZSIsInRpZXIiOiJnb2xkIn0.ho9UHPFu93jy9VEgonlC1LkYQ4FrRJG1N25Dw8EhQWux9oySKLkSyV1LAvMnTzsBDOaFE6wz1b9DD96BBzW2FGgEZFbCCDNhc8uUVXgbdykyY6fr8yS7lLzcKPOjKExMfMNLWYoa0HJHr4qSlCI1QFBGlRGEXDFYHfaohnRWyiQvNtFn6UgnOo8oaRFTxuZNgRcVRBVPAqJ-M8Iy3rRu7Pcssib5LTCn4y7W29UAaQBz9I3Caf24nV-46WU6D5LNAisMdPLVzm8JidmihWZb5iuUq8dsvhwpeRwAVg4gJhU3kh34KRGHOARnb01TlKTptp4rI9j5rd3C9b_l5lzZDg";
 
     fn config() -> ValidatorConfig {
         ValidatorConfig {
@@ -256,6 +308,25 @@ mod tests {
                 secret: "topsecret".to_string(),
                 alg: "HS256".to_string(),
             }],
+            issuer: Some("https://issuer.example".to_string()),
+            audience: Some("edge".to_string()),
+            required_scopes: vec!["read".to_string()],
+            ..ValidatorConfig::default()
+        }
+    }
+
+    fn rsa_config() -> ValidatorConfig {
+        ValidatorConfig {
+            jwks: Jwks {
+                keys: vec![JwkKey {
+                    kty: "RSA".to_string(),
+                    kid: Some("rsa-test-key".to_string()),
+                    alg: Some("RS256".to_string()),
+                    key_use: Some("sig".to_string()),
+                    n: RSA_MODULUS.to_string(),
+                    e: "AQAB".to_string(),
+                }],
+            },
             issuer: Some("https://issuer.example".to_string()),
             audience: Some("edge".to_string()),
             required_scopes: vec!["read".to_string()],
@@ -281,6 +352,36 @@ mod tests {
         assert_eq!(context.subject, "user-123");
         assert_eq!(context.key_id, "test-key");
         assert_eq!(context.scopes, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn validates_rs256_jwt_from_jwks() {
+        let context = validate_jwt(RSA_TOKEN, &rsa_config(), 1779660000).unwrap();
+        assert_eq!(context.subject, "user-rsa");
+        assert_eq!(context.key_id, "rsa-test-key");
+        assert_eq!(context.scopes, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn rejects_unknown_rs256_kid() {
+        let mut parts: Vec<&str> = RSA_TOKEN.split('.').collect();
+        parts[0] = "eyJhbGciOiJSUzI1NiIsImtpZCI6Im1pc3NpbmciLCJ0eXAiOiJKV1QifQ";
+        let token = parts.join(".");
+        assert_eq!(
+            validate_jwt(&token, &rsa_config(), 1779660000).unwrap_err(),
+            "unknown-kid"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_rs256_signature() {
+        let mut token = RSA_TOKEN.to_string();
+        token.pop();
+        token.push('A');
+        assert_eq!(
+            validate_jwt(&token, &rsa_config(), 1779660000).unwrap_err(),
+            "invalid-jwt-signature"
+        );
     }
 
     #[test]

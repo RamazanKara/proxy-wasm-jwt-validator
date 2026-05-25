@@ -9,15 +9,16 @@ the module uses standard Proxy-Wasm request header operations where possible.
 ## What It Does
 
 - Validates `Authorization: Bearer <jwt>` HS256 JWTs.
+- Validates RS256 JWTs with an embedded JWKS.
 - Validates opaque API tokens from `X-API-Token`.
-- Checks `kid`, HMAC signature, `exp`, `nbf`, `iat`, issuer, audience, required
-  scopes, and required exact claims.
+- Checks `kid`, HMAC/RSA signature, `exp`, `nbf`, `iat`, issuer, audience,
+  required scopes, and required exact claims.
 - Emits trusted auth context as request headers for VCL/backend use.
 - Strips raw token headers before backend fetch by default.
 - Supports `enforce` and `report` mode.
 
-RS256/JWKS support is intentionally left for a later release so the first module
-stays deterministic, small, and easy to soak-test in vmod-wasm.
+JWKS keys are configured inline. The module does not fetch remote JWKS URLs from
+inside Varnish workers.
 
 ## Varnish / vmod-wasm
 
@@ -33,7 +34,7 @@ sub vcl_init {
 sub vcl_recv {
     set req.http.X-Wasm-Action =
         wasm.proxy_wasm_on_request_configured("auth", "",
-            {"{"keys":[{"id":"test-key","secret":"topsecret" }],"issuer":"https://issuer.example","audience":"edge","required_scopes":["read"],"mode":"enforce" }"});
+            {"{"keys":[{"id":"test-key","secret":"topsecret" }],"jwks":{"keys":[{"kty":"RSA","kid":"rsa-key","alg":"RS256","use":"sig","n":"<base64url-modulus>","e":"AQAB" }]},"issuer":"https://issuer.example","audience":"edge","required_scopes":["read"],"mode":"enforce" }"});
 
     if (req.http.X-Wasm-Action != "0") {
         return (synth(401, "Unauthorized"));
@@ -57,6 +58,7 @@ By default it removes `Authorization` and `X-API-Token` before backend fetch.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `keys` | array | `[]` | HS256 JWT keys with `id`, `secret`, and optional `alg`. |
+| `jwks` | object | `{"keys":[]}` | Embedded JWKS for RS256 keys. Each key needs `kty:"RSA"`, `kid`, `n`, `e`, and optional `alg:"RS256"` / `use:"sig"`. |
 | `api_tokens` | array | `[]` | Opaque tokens with `id`, `token`, `subject`, and `scopes`. |
 | `authorization_header` | string | `authorization` | Header containing a bearer JWT. |
 | `api_key_header` | string | `x-api-token` | Header containing an opaque API token. |
@@ -69,6 +71,16 @@ By default it removes `Authorization` and `X-API-Token` before backend fetch.
 | `require_kid` | bool | `false` | Require JWT `kid`. |
 | `emit_headers` | bool | `true` | Emit auth context headers. |
 | `strip_token_headers` | bool | `true` | Remove raw credentials before backend fetch. |
+
+### RS256 / JWKS
+
+Configure public RSA keys under `jwks.keys`. The JWT header `alg` must be
+`RS256`; `kid` selects the matching JWK. If `require_kid` is false and exactly
+one RS256 key is configured, a JWT without `kid` can use that key.
+
+Remote JWKS discovery and refresh are intentionally out of scope for this
+module. Rotate keys by deploying updated plugin configuration with overlapping
+old and new keys during the rollout window.
 
 ## Build
 
