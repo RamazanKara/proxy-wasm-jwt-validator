@@ -22,7 +22,7 @@ rsa = { version = "0.10.0-rc.18", default-features = false, features = ["sha2", 
 serde = { version = "1", features = ["derive"] }
 serde-json-wasm = "1"
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [profile.release]
 codegen-units = 1
