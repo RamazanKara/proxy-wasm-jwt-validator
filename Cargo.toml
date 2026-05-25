@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 proxy-wasm = "0.2.5"
 rsa = { version = "0.10.0-rc.18", default-features = false, features = ["sha2", "std"] }
 serde = { version = "1", features = ["derive"] }
